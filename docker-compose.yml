@@ -1,0 +1,52 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: vehicle_rental
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d vehicle_rental']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: development
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: development
+      PORT: 3000
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: vehicle_rental
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_POOL_MIN: 2
+      DB_POOL_MAX: 10
+      JWT_SECRET: docker-development-secret-change-before-production
+      UPLOAD_DIR: uploads
+    ports:
+      - '3000:3000'
+    volumes:
+      - vehicle_uploads:/app/uploads
+      - ./src:/app/src
+      - ./database:/app/database
+      - ./knexfile.ts:/app/knexfile.ts:ro
+    command: sh -c "npm run build && npm run db:migrate && npm run db:seed && npm run dev"
+
+volumes:
+  postgres_data:
+  vehicle_uploads:
