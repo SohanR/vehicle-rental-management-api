@@ -22,6 +22,27 @@ const vehicles = [
     daily_rate: 9000.0,
     photo_path: null,
   },
+  {
+    name: 'Suzuki Swift 2023',
+    plate_number: 'DHAKA-METRO-GA-14-4004',
+    category: 'Hatchback',
+    daily_rate: 3800.0,
+    photo_path: null,
+  },
+  {
+    name: 'Nissan Navara 2022',
+    plate_number: 'DHAKA-METRO-THA-15-5005',
+    category: 'Pickup',
+    daily_rate: 8500.0,
+    photo_path: null,
+  },
+  {
+    name: 'Toyota Noah 2024',
+    plate_number: 'DHAKA-METRO-CHA-16-6006',
+    category: 'Minivan',
+    daily_rate: 8000.0,
+    photo_path: null,
+  },
 ];
 
 export async function seed(knex: Knex): Promise<void> {
