@@ -195,6 +195,26 @@ UPLOAD_DIR=uploads
 
 `JWT_SECRET` must contain at least 32 characters. Do not commit the `.env` file.
 
+### Environment variable reference
+
+| Variable      | Required | Default       | Purpose                                                            |
+| ------------- | -------- | ------------- | ------------------------------------------------------------------ |
+| `NODE_ENV`    | No       | `development` | Runtime mode: `development`, `test`, or `production`.              |
+| `PORT`        | No       | `3000`        | HTTP port exposed by the Express server.                           |
+| `DB_HOST`     | Yes      | —             | PostgreSQL hostname; use `postgres` inside Docker Compose.         |
+| `DB_PORT`     | No       | `5432`        | PostgreSQL server port.                                            |
+| `DB_NAME`     | Yes      | —             | Application database name.                                         |
+| `DB_USER`     | Yes      | —             | PostgreSQL login role.                                             |
+| `DB_PASSWORD` | Yes      | —             | Password for the PostgreSQL role.                                  |
+| `DB_POOL_MIN` | No       | `2`           | Minimum number of Knex pool connections.                           |
+| `DB_POOL_MAX` | No       | `10`          | Maximum pool connections; must be at least `DB_POOL_MIN`.          |
+| `JWT_SECRET`  | Yes      | —             | HMAC secret used to sign and verify JWTs; minimum 32 characters.   |
+| `UPLOAD_DIR`  | No       | `uploads`     | Local upload root; vehicle photos use its `vehicles` subdirectory. |
+
+Configuration is validated at startup. The process exits before accepting requests if a required
+value is missing, a number is outside its allowed range, or the pool bounds are invalid. The
+committed `.env.example` contains development placeholders; deployments must provide real secrets.
+
 ### 5. Run database migrations
 
 For source-based local development, run:
@@ -328,6 +348,17 @@ flowchart LR
 - **Routes** manually create and inject repositories, services, and controllers.
 - **Middleware** provides Helmet, CORS, request IDs, Pino logging, JWT authentication, login rate limiting, validation, file uploads, and centralized errors.
 
+The layers have separate responsibilities:
+
+1. A **route** declares the HTTP method, authentication, upload handling, and validators.
+2. A **controller** reads typed request values and shapes the HTTP response.
+3. A **service** owns business validation, pricing, availability, and transactions.
+4. A **repository** owns Knex queries and raw SQL.
+5. Central **error middleware** produces a consistent JSON error response.
+
+Dependencies are constructed explicitly in route modules, keeping the application testable without
+introducing a dependency-injection framework.
+
 Vehicle photos are stored under `uploads/vehicles` and served from `/uploads/vehicles/<filename>`.
 Only JPEG, PNG, and WebP files up to 5 MB are accepted. Replaced and failed uploads are cleaned up safely.
 
@@ -341,9 +372,36 @@ AND
 existing.end_date >= requested.start_date
 ```
 
-Cancelled rentals are excluded. Updates also exclude the current rental ID.
+The repository implements the rule with this predicate:
 
-To prevent two concurrent requests from booking the same available dates, the service opens a transaction and locks the vehicle row with PostgreSQL `FOR UPDATE`. Every booking for that vehicle must acquire the same lock. The first request commits; the waiting request then sees the new overlap and receives `409 Conflict`.
+```sql
+WHERE vehicle_id = :vehicle_id
+  AND status <> 'cancelled'
+  AND start_date <= :requested_end
+  AND end_date >= :requested_start
+```
+
+The comparison is inclusive, so a request starting on an existing rental's `end_date` conflicts.
+Cancelled rentals are excluded. Updates add `AND id <> :current_rental_id`, preventing the rental
+from conflicting with itself. Availability is rechecked whenever the vehicle or dates change, or
+when a previously cancelled rental becomes active again.
+
+### Transaction and concurrency handling
+
+Rental creation runs inside one Knex transaction:
+
+1. Select the requested active vehicle using PostgreSQL `FOR UPDATE`.
+2. Check for a non-cancelled overlap inside the same transaction.
+3. Calculate the inclusive total using the locked vehicle's daily rate.
+4. Insert the rental and commit.
+
+Every booking attempt for the same vehicle locks the same row. If two requests arrive together, one
+waits. After the first commits, the waiting transaction sees the new rental and returns `409
+Conflict`. Bookings for unrelated vehicles remain independent.
+
+Updates also run in a transaction. The rental row is locked first, and the target vehicle is locked
+when booking fields change. Any exception rolls the transaction back automatically, preventing
+partial changes or incorrectly calculated totals.
 
 Rental pricing is calculated by the server using inclusive days:
 
@@ -356,14 +414,37 @@ Clients cannot choose `total_amount`.
 
 ## Monthly report behavior
 
-The monthly report performs date trimming in PostgreSQL:
+The report selects non-cancelled rentals that intersect the requested inclusive month:
 
 ```sql
-GREATEST(r.start_date, month_start) AS effective_start
+r.status <> 'cancelled'
+AND r.start_date <= month_end
+AND r.end_date >= month_start
+```
+
+Each matching rental is clipped to the month boundaries:
+
+```sql
+GREATEST(r.start_date, month_start) AS effective_start,
 LEAST(r.end_date, month_end) AS effective_end
 ```
 
-It counts only the portion inside the requested month. A rental from July 29 through August 3 contributes exactly August 1, 2, and 3: three rented days and three days of revenue. Cancelled rentals are not included.
+Prorated values are then calculated using inclusive dates:
+
+```sql
+days_in_month = (effective_end - effective_start) + 1
+booked_daily_rate = r.total_amount / ((r.end_date - r.start_date) + 1)
+prorated_revenue = days_in_month * booked_daily_rate
+```
+
+Revenue comes from the rental's stored `total_amount`, not the vehicle's current `daily_rate`, so a
+later fleet-rate change cannot rewrite historical revenue. A July 29–August 3 rental contributes
+three August days and three days of its original booked revenue.
+
+The query groups by vehicle and returns `total_bookings`, `days_rented`, and `revenue`. The service
+also identifies `top_revenue_vehicle`. The optional `vehicle_id` filter is parameterized. Active
+vehicles without activity return zero totals, while a soft-deleted vehicle remains in a historical
+report if it had qualifying rental activity.
 
 Example requests:
 
